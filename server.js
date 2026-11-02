@@ -14,9 +14,15 @@ const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Email Transporter Config
+app.use(express.static(path.join(__dirname, 'public'), {
+    etag: false,
+    lastModified: false,
+    setHeaders: (res, path) => {
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    }
+}));
+
 const transporter = nodemailer.createTransport({
     service: 'gmail',
     auth: {
@@ -25,7 +31,6 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Initialize SQLite Database with Flow Chart fields
 const dbFile = path.join(__dirname, 'database.sqlite');
 const db = new sqlite3.Database(dbFile, (err) => {
     if (err) console.error('Error opening database', err.message);
@@ -46,7 +51,8 @@ db.serialize(() => {
         technicianPhoto TEXT,
         aadharNo TEXT,
         problemDescription TEXT,
-        paymentDetails TEXT
+        paymentDetails TEXT,
+        components TEXT
     )`);
 });
 
@@ -55,7 +61,8 @@ function broadcastProducts() {
         if (!err) {
             const parsedRows = rows.map(r => ({
                 ...r,
-                timeline: JSON.parse(r.timeline)
+                timeline: JSON.parse(r.timeline || '[]'),
+                components: JSON.parse(r.components || '[]')
             }));
             io.emit('product_updated', parsedRows);
         }
@@ -66,21 +73,21 @@ io.on('connection', (socket) => {
     console.log('A client connected live:', socket.id);
 });
 
-// API: Get all products
 app.get('/api/products', (req, res) => {
     db.all(`SELECT * FROM products`, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         const parsedRows = rows.map(r => ({
             ...r,
-            timeline: JSON.parse(r.timeline)
+            timeline: JSON.parse(r.timeline || '[]'),
+            components: JSON.parse(r.components || '[]')
         }));
         res.json(parsedRows);
     });
 });
 
-// API: Inward new product
+// API: Inward new product with components
 app.post('/api/products', (req, res) => {
-    const { serialNumber, productName, technicianName, phone, clientEmail, technicianPhoto, aadharNo } = req.body;
+    const { serialNumber, productName, technicianName, phone, clientEmail, technicianPhoto, aadharNo, components } = req.body;
     const now = new Date().toLocaleTimeString();
     const id = Date.now().toString();
 
@@ -92,74 +99,76 @@ app.post('/api/products', (req, res) => {
     const initialTimeline = JSON.stringify([
         { status: 'Inwarded', time: now, remarks: 'Material Inward registered at gate.' }
     ]);
-
-    const query = `INSERT INTO products (id, serialNumber, productName, currentStatus, updatedAt, timeline, technicianName, phone, clientEmail, technicianPhoto, aadharNo, problemDescription, paymentDetails) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
     
-    db.run(query, [id, cleanSerial, productName, 'Inwarded', now, initialTimeline, technicianName || '', phone || '', clientEmail || '', technicianPhoto || '', aadharNo || '', '', 'Pending Payment'], function(err) {
+    const jsonComponents = JSON.stringify(Array.isArray(components) ? components : []);
+
+    const query = `INSERT INTO products (id, serialNumber, productName, currentStatus, updatedAt, timeline, technicianName, phone, clientEmail, technicianPhoto, aadharNo, problemDescription, paymentDetails, components) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+    
+    db.run(query, [id, cleanSerial, productName, 'Inwarded', now, initialTimeline, technicianName || '', phone || '', clientEmail || '', technicianPhoto || '', aadharNo || '', '', 'Pending Payment', jsonComponents], function(err) {
         if (err) {
-            return res.status(400).json({ error: 'Serial Number already exists!' });
+            console.error('Database Insert Error:', err.message);
+            return res.status(400).json({ error: 'Serial Number already exists or DB Error!' });
         }
         broadcastProducts();
         res.status(201).json({ success: true });
     });
 });
 
-// API: Update status, problem description, and trigger Email + WhatsApp Notifications
 app.put('/api/products/:id/status', (req, res) => {
     const { id } = req.params;
-    const { newStatus, remarks, problemDescription, paymentDetails, clientEmail } = req.body;
+    const { currentStatus, newStatus, remarks, problemDescription, paymentDetails, clientEmail } = req.body;
+    
+    const finalStatus = currentStatus || newStatus; 
+    const finalRemarks = remarks || problemDescription;
     const now = new Date().toLocaleTimeString();
+
+    if (!finalStatus) {
+        return res.status(400).json({ error: 'Status is required' });
+    }
 
     db.get(`SELECT * FROM products WHERE id = ?`, [id], (err, product) => {
         if (err || !product) {
             return res.status(404).json({ error: 'Product not found' });
         }
 
-        let timeline = JSON.parse(product.timeline);
-        if (!timeline.some(t => t.status === newStatus)) {
-            timeline.push({ status: newStatus, time: now, remarks: remarks || 'Status updated.' });
+        let timeline = [];
+        try {
+            timeline = JSON.parse(product.timeline || '[]');
+        } catch (e) {
+            timeline = [];
+        }
+
+        if (!timeline.some(t => t.status === finalStatus)) {
+            timeline.push({ status: finalStatus, time: now, remarks: finalRemarks || 'Status updated.' });
         }
 
         const updateQuery = `UPDATE products SET currentStatus = ?, updatedAt = ?, timeline = ?, problemDescription = COALESCE(?, problemDescription), paymentDetails = COALESCE(?, paymentDetails) WHERE id = ?`;
         
-        db.run(updateQuery, [newStatus, now, JSON.stringify(timeline), problemDescription, paymentDetails, id], function(err) {
+        db.run(updateQuery, [finalStatus, now, JSON.stringify(timeline), finalRemarks, paymentDetails, id], function(err) {
             if (err) return res.status(500).json({ error: err.message });
 
             broadcastProducts();
 
             const targetEmail = clientEmail || product.clientEmail;
-            
-            // 1. Email Notification Dispatch
             if (targetEmail) {
                 const mailOptions = {
                     from: 'ABC Company Tracking <yourcompanyemail@gmail.com>',
                     to: targetEmail,
-                    subject: `[Material Tracking Update] ${product.serialNumber} is now ${newStatus}`,
+                    subject: `[Material Tracking Update] ${product.serialNumber} is now ${finalStatus}`,
                     html: `
                         <h3>ABC Company - Material Status Update</h3>
                         <p>Your product <b>${product.productName}</b> (Serial: <b>${product.serialNumber}</b>) status has been updated.</p>
-                        <p><b>Current Status:</b> <span style="color: #06b6d4;">${newStatus}</span></p>
-                        <p><b>Problem / Remarks:</b> ${problemDescription || remarks || 'N/A'}</p>
-                        <p><b>Payment Details:</b> ${paymentDetails || 'N/A'}</p>
+                        <p><b>Current Status:</b> <span style="color: #06b6d4;">${finalStatus}</span></p>
+                        <p><b>Problem / Remarks:</b> ${finalRemarks || 'N/A'}</p>
                         <p><b>Updated Time:</b> ${now}</p>
                     `
                 };
-
-                transporter.sendMail(mailOptions, (mailErr, info) => {
+                transporter.sendMail(mailOptions, (mailErr) => {
                     if (mailErr) console.error('Email error:', mailErr);
-                    else console.log('Email sent successfully:', info.response);
                 });
             }
 
-            // 2. WhatsApp Bot Notification Dispatch
-            if (product.phone) {
-                const whatsappMessage = `*ABC Company Update*\n\nProduct: ${product.productName}\nSerial: ${product.serialNumber}\nStatus: *${newStatus}*\nRemarks: ${problemDescription || remarks || 'N/A'}\nTime: ${now}`;
-                
-                // Note: Integrate your WhatsApp Bot API call here (e.g., Twilio, WATI, or local whatsapp-web.js client)
-                console.log(`[WhatsApp Bot Triggered] Sending message to ${product.phone}: \n${whatsappMessage}`);
-            }
-
-            res.json({ success: true, message: 'Status updated and notifications sent successfully!' });
+            res.json({ success: true, message: 'Status updated successfully!' });
         });
     });
 });
