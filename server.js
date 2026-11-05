@@ -1,4 +1,3 @@
-require('dotenv').config(); // Local system-la .env load panna
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -31,7 +30,7 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Check if DATABASE_URL exists (Cloud or Local with .env)
+// Check if running on cloud (Render with DATABASE_URL) or local
 const isProduction = !!process.env.DATABASE_URL;
 let db;
 let pool;
