@@ -1,3 +1,4 @@
+require('dotenv').config(); // Local system-la .env load panna
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -30,7 +31,7 @@ const transporter = nodemailer.createTransport({
     }
 });
 
-// Check if running on cloud (Render with DATABASE_URL) or local
+// Check if DATABASE_URL exists (Cloud or Local with .env)
 const isProduction = !!process.env.DATABASE_URL;
 let db;
 let pool;
@@ -142,7 +143,6 @@ app.get('/api/products', (req, res) => {
     }
 });
 
-// API: Inward new product with components
 app.post('/api/products', (req, res) => {
     const { serialNumber, productName, technicianName, phone, clientEmail, technicianPhoto, aadharNo, components } = req.body;
     const now = new Date().toLocaleTimeString();
@@ -301,7 +301,7 @@ app.delete('/api/products/:id', (req, res) => {
         });
     } else {
         db.run(`DELETE FROM products WHERE id = ?`, [id], function(err) {
-            if (err) return res.status(500).json({ error: arg2 || err.message });
+            if (err) return res.status(500).json({ error: err.message });
             if (this.changes === 0) return res.status(404).json({ error: 'Product not found' });
             broadcastProducts();
             res.json({ success: true, message: 'Product deleted successfully' });
